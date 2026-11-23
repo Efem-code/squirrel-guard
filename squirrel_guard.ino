@@ -2,9 +2,18 @@
 // Teensy 4.1 + HuskyLens 2 + 2x MG996R pan/tilt + 12V diaphragm pump
 // Libraries: Servo (built in), HUSKYLENS (DFRobot).
 // Confirm the HUSKYLENS API, baud rate and frame size against your HuskyLens 2 library version.
+//
+// Serial output (115200 baud) for the dashboard:
+//   T,<ms>,<pan>,<tilt>,<seen 0/1>,<aligned 0/1>,<spraying 0/1>,<water 0/1>,<sprays>,<bench 0/1>
+//   E,<event>[,<detail>]     events: READY, NO_HUSKY, SPRAY_ON, SPRAY_OFF, LOST, BENCH
 
 #include <Servo.h>
 #include "HUSKYLENS.h"
+
+// ---------- Safety ----------
+// true = the pump NEVER turns on. Use this for every bench test.
+// Set to false only after the aiming and wiring have been checked with no water.
+const bool BENCH_MODE = true;
 
 // ---------- Pins ----------
 const uint8_t PIN_PAN   = 2;   // pan servo signal
@@ -30,6 +39,7 @@ const float TILT_MIN = 40, TILT_MAX = 130, TILT_HOME = 90;
 const unsigned long SPRAY_MS     = 1500;  // max continuous spray per event
 const unsigned long COOLDOWN_MS  = 5000;  // rest time between sprays
 const unsigned long LOST_HOME_MS = 3000;  // return to home after this long without a target
+const unsigned long TELEM_MS     = 200;   // how often a status line is sent to the dashboard
 
 HUSKYLENS huskylens;
 Servo panServo, tiltServo;
@@ -37,15 +47,33 @@ Servo panServo, tiltServo;
 float panAng = PAN_HOME, tiltAng = TILT_HOME;
 int confirmCount = 0;
 bool spraying = false;
-unsigned long sprayStart = 0, lastSpray = 0, lastSeen = 0;
+bool seenNow = false;
+bool alignedNow = false;
+unsigned long sprayCount = 0;
+unsigned long sprayStart = 0, lastSpray = 0, lastSeen = 0, lastTelem = 0;
 
 void setPump(bool on) {
-  digitalWrite(PIN_PUMP, on ? HIGH : LOW);
-  digitalWrite(PIN_LED, on ? HIGH : LOW);
+  // Bench mode blocks the pump at the lowest level, so no code path can spray.
+  bool drive = on && !BENCH_MODE;
+  digitalWrite(PIN_PUMP, drive ? HIGH : LOW);
+  digitalWrite(PIN_LED, on ? HIGH : LOW);  // LED still shows the intended state
 }
 
 bool waterOK() {
   return digitalRead(PIN_LEVEL) == LOW;  // LOW = float switch closed = water present
+}
+
+void sendTelemetry(unsigned long now) {
+  Serial.print("T,");
+  Serial.print(now);            Serial.print(',');
+  Serial.print(panAng, 1);      Serial.print(',');
+  Serial.print(tiltAng, 1);     Serial.print(',');
+  Serial.print(seenNow ? 1 : 0);    Serial.print(',');
+  Serial.print(alignedNow ? 1 : 0); Serial.print(',');
+  Serial.print(spraying ? 1 : 0);   Serial.print(',');
+  Serial.print(waterOK() ? 1 : 0);  Serial.print(',');
+  Serial.print(sprayCount);     Serial.print(',');
+  Serial.println(BENCH_MODE ? 1 : 0);
 }
 
 void setup() {
@@ -63,11 +91,11 @@ void setup() {
 
   Serial1.begin(9600);  // HuskyLens UART on Teensy pins 0 (RX1) and 1 (TX1)
   while (!huskylens.begin(Serial1)) {
-    Serial.println("HuskyLens not found, check wiring and baud rate");
+    Serial.println("E,NO_HUSKY");
     delay(500);
   }
   huskylens.writeAlgorithm(ALGORITHM_OBJECT_RECOGNITION);
-  Serial.println("Squirrel Guard ready");
+  Serial.println(BENCH_MODE ? "E,BENCH" : "E,READY");
 }
 
 void loop() {
@@ -79,7 +107,12 @@ void loop() {
     spraying = false;
     lastSpray = now;
     confirmCount = 0;
-    Serial.println("spray off");
+    Serial.println("E,SPRAY_OFF");
+  }
+
+  if (now - lastTelem >= TELEM_MS) {
+    sendTelemetry(now);
+    lastTelem = now;
   }
 
   if (!huskylens.request()) return;
@@ -96,6 +129,9 @@ void loop() {
     }
   }
 
+  seenNow = found;
+  alignedNow = false;
+
   if (found) {
     lastSeen = now;
 
@@ -110,8 +146,8 @@ void loop() {
     panServo.write(panAng);
     tiltServo.write(tiltAng);
 
-    bool aligned = abs(ex) <= ALIGN_PX && abs(ey) <= ALIGN_PX;
-    confirmCount = aligned ? confirmCount + 1 : 0;
+    alignedNow = abs(ex) <= ALIGN_PX && abs(ey) <= ALIGN_PX;
+    confirmCount = alignedNow ? confirmCount + 1 : 0;
 
     if (!spraying &&
         confirmCount >= CONFIRM_FRAMES &&
@@ -119,12 +155,16 @@ void loop() {
         waterOK()) {
       spraying = true;
       sprayStart = now;
+      sprayCount++;
       setPump(true);
-      Serial.println("SPRAY");
+      Serial.println("E,SPRAY_ON");
     }
   } else {
     confirmCount = 0;
     if (!spraying && now - lastSeen > LOST_HOME_MS) {
+      if (abs(panAng - PAN_HOME) > 0.5 || abs(tiltAng - TILT_HOME) > 0.5) {
+        Serial.println("E,LOST");
+      }
       panAng = PAN_HOME;
       tiltAng = TILT_HOME;
       panServo.write(panAng);
